@@ -11,18 +11,13 @@ const client = new Client({
     partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
 
-const TOKEN = process.env.TOKEN;
-const STARBOARD_CHANNEL_ID = process.env.STARBOARD_CHANNEL_ID;
-
-// Update the MongoDB URI from your .env file
-const MONGODB_URI = process.env.MONGODB_URI;
+const { TOKEN, MONGODB_URI, WEBHOOK1_ID, WEBHOOK1_TOKEN, WEBHOOK2_ID, WEBHOOK2_TOKEN } = process.env;
 
 mongoose.connect(MONGODB_URI, { useUnifiedTopology: true, useNewUrlParser: true })
     .then(() => console.log('Connected to MongoDB'))
     .catch(err => console.error('Error connecting to MongoDB:', err));
 
-// Schema for RepostedMessage
-const RepostedMessageSchema = new mongoose.Schema({
+const RepostedMessage = mongoose.model('RepostedMessage', new mongoose.Schema({
     guildName: String,
     guildId: String,
     star: {
@@ -30,30 +25,27 @@ const RepostedMessageSchema = new mongoose.Schema({
         starboardMessageID: String,
         timestamp: Date,
     }
-});
+}));
 
-// Model for RepostedMessage
-const RepostedMessage = mongoose.model('RepostedMessage', RepostedMessageSchema);
-
-// Schema for GuildSettings
-const GuildSettingsSchema = new mongoose.Schema({
+const GuildSettings = mongoose.model('GuildSettings', new mongoose.Schema({
     guildName: String,
     guildId: String,
     star: {
         whitelistChannelIds: [String],
+        starboardChannelIds: [String],
         starLevels: [{
             level: Number,
             minReactions: Number,
         }],
     },
-});
-
-// Model for GuildSettings
-const GuildSettings = mongoose.model('GuildSettings', GuildSettingsSchema);
+}));
 
 const lock = new Map();
+const webhookConfigs = [
+    { id: WEBHOOK1_ID, token: WEBHOOK1_TOKEN },
+    { id: WEBHOOK2_ID, token: WEBHOOK2_TOKEN },
+];
 
-// Register slash commands
 client.on('ready', () => {
     client.guilds.cache.forEach(guild => {
         guild.commands.set([
@@ -76,8 +68,8 @@ client.on('ready', () => {
                                 .setDescription('Remove a channel from the whitelist')
                                 .setRequired(false))
                         .addChannelOption(option =>
-                            option.setName('list')
-                                .setDescription('Get the list of channels in the whitelist')
+                            option.setName('set')
+                                .setDescription('Set a channel to the starboard')
                                 .setRequired(false)))
                 .addSubcommand(subcommand =>
                     subcommand
@@ -101,171 +93,118 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName, options } = interaction;
 
     if (commandName === 'ping') {
-        // Ping command
         const botLatency = Date.now() - interaction.createdTimestamp;
-
         await interaction.reply({
             content: `🏓 Pong! Latency: ${botLatency}ms`,
             ephemeral: false,
         });
     } else if (commandName === 'star') {
-        // Star command
         const subcommand = options.getSubcommand();
         const guildId = interaction.guild.id;
         const guildName = interaction.guild.name;
 
         try {
-            let level;
-            let minReactions;
-
             switch (subcommand) {
                 case 'repost':
-                    // Configure starboard level
-                    level = options.getInteger('level');
-                    minReactions = options.getInteger('count');
+                    const level = options.getInteger('level');
+                    const minReactions = options.getInteger('count');
+                    await handleStarboardConfiguration(interaction, guildId, guildName, level, minReactions);
                     break;
 
                 case 'whitelist':
-                    // Whitelist channel add/remove
-                    const addChannelOption = options.getChannel('add');
-                    const removeChannelOption = options.getChannel('remove');
-                    const listChannelOption = options.getChannel('list');
-
-                    if (listChannelOption) {
-                        await handleListWhitelist(interaction, guildId, guildName);
-                        return;
-                    }
-
-                    if (!addChannelOption && !removeChannelOption) {
-                        return interaction.reply({
-                            content: 'Please provide a channel to add or remove from the whitelist.',
-                            ephemeral: false,
-                        });
-                    }
-
-                    let channelId;
-                    let action;
-
-                    if (addChannelOption) {
-                        channelId = addChannelOption.id;
-                        action = 'add';
-                    } else if (removeChannelOption) {
-                        channelId = removeChannelOption.id;
-                        action = 'remove';
-                    }
-
-                    switch (action) {
-                        case 'add':
-                            await handleAddWhitelist(interaction, guildId, channelId, guildName);
-                            break;
-                        case 'remove':
-                            await handleRemoveWhitelist(interaction, guildId, channelId, guildName);
-                            break;
-                        default:
-                            break;
-                    }
-                    return;
+                    await handleWhitelistOperation(interaction, guildId, guildName, options);
+                    break;
 
                 default:
-                    return;
+                    break;
             }
-
-            // Fetch guild settings from the database
-            const guildSettings = await GuildSettings.findOne({
-                guildId
-            });
-
-            if (!guildSettings) {
-                console.error(`Guild settings not found for guild ID: ${guildId}`);
-                return interaction.reply({
-                    content: 'Guild settings not found. Please make sure to set up your guild settings first.',
-                    ephemeral: true,
-                });
-            }
-
-            // Check if the level already exists in the array
-            const existingLevelIndex = guildSettings.star.starLevels.findIndex(
-                (starLevel) => starLevel.level === level
-            );
-
-            if (existingLevelIndex !== -1) {
-                // Update the existing entry
-                guildSettings.star.starLevels[existingLevelIndex].minReactions = minReactions;
-            } else {
-                // Add a new entry
-                guildSettings.star.starLevels.push({
-                    level,
-                    minReactions,
-                });
-            }
-
-            // Save the updated data to the database
-            await guildSettings.save();
-
-            await interaction.reply({
-                content: `Starboard level ${level} configured with ${minReactions} reactions`,
-                ephemeral: false,
-            });
         } catch (error) {
-            console.error('Error configuring starboard level:', error);
+            console.error('Error handling interaction:', error);
             await interaction.reply({
-                content: 'Error configuring starboard level',
+                content: 'Error handling interaction',
                 ephemeral: false,
             });
         }
     }
 });
 
-async function handleListWhitelist(interaction, guildId, guildName) {
-    try {
-        const guildSettings = await GuildSettings.findOne({ guildId });
+async function handleStarboardConfiguration(interaction, guildId, guildName, level, minReactions) {
+    const guildSettings = await getGuildSettings(guildId, guildName);
 
-        if (!guildSettings) {
-            console.error(`Guild settings not found for guild ID: ${guildId}`);
-            return interaction.reply({
-                content: 'Guild settings not found. Please make sure to set up your guild settings first.',
-                ephemeral: true,
-            });
-        }
-
-        const whitelistChannels = guildSettings.star.whitelistChannelIds;
-        const formattedChannels = whitelistChannels.map(channelId => `<#${channelId}>`).join(', ');
-
-        await interaction.reply({
-            content: `Whitelist channels: ${formattedChannels}`,
-            ephemeral: false,
+    if (!guildSettings) {
+        return interaction.reply({
+            content: 'Guild settings not found. Please set up your guild settings first.',
+            ephemeral: true,
         });
-    } catch (error) {
-        console.error('Error listing whitelist channels:', error);
-        await interaction.reply({
-            content: 'Error listing whitelist channels',
+    }
+
+    const existingLevelIndex = guildSettings.star.starLevels.findIndex(
+        (starLevel) => starLevel.level === level
+    );
+
+    if (existingLevelIndex !== -1) {
+        guildSettings.star.starLevels[existingLevelIndex].minReactions = minReactions;
+    } else {
+        guildSettings.star.starLevels.push({ level, minReactions });
+    }
+
+    await guildSettings.save();
+    await interaction.reply({
+        content: `Starboard level ${level} configured with ${minReactions} reactions`,
+        ephemeral: false,
+    });
+}
+
+async function handleWhitelistOperation(interaction, guildId, guildName, options) {
+    const addChannelOption = options.getChannel('add');
+    const removeChannelOption = options.getChannel('remove');
+    const setChannelOption = options.getChannel('set');
+
+    if (!addChannelOption && !removeChannelOption && !setChannelOption) {
+        return interaction.reply({
+            content: 'Please provide a channel to add, remove, or set in the whitelist.',
             ephemeral: false,
         });
     }
+
+    let channelId;
+    let action;
+
+    if (addChannelOption) {
+        channelId = addChannelOption.id;
+        action = 'add';
+    } else if (removeChannelOption) {
+        channelId = removeChannelOption.id;
+        action = 'remove';
+    } else if (setChannelOption) {
+        channelId = setChannelOption.id;
+        action = 'set';
+    }
+
+    switch (action) {
+        case 'add':
+            await handleWhitelistAdd(interaction, guildId, channelId, guildName);
+            break;
+        case 'remove':
+            await handleWhitelistRemove(interaction, guildId, channelId, guildName);
+            break;
+        case 'set':
+            await handleWhitelistSet(interaction, guildId, channelId, guildName);
+            break;
+        default:
+            break;
+    }
 }
 
-async function handleAddWhitelist(interaction, guildId, channelId, guildName) {
+async function handleWhitelistAdd(interaction, guildId, channelId, guildName) {
     try {
-        // Update the document to push the new channelId to the whitelistChannels array
-        const channelOption = interaction.options.getChannel('add');
-
-        if (!channelOption) {
-            return interaction.reply({
-                content: 'Please provide a channel to add to the whitelist.',
-                ephemeral: true,
-            });
-        }
-
-        const addedChannelId = channelOption.id;
-
         await GuildSettings.findOneAndUpdate(
             { guildId },
-            { $addToSet: { 'star.whitelistChannelIds': addedChannelId }, guildName },
+            { $addToSet: { 'star.whitelistChannelIds': channelId }, guildName },
             { upsert: true }
         );
-
         await interaction.reply({
-            content: `Whitelist channel added: <#${addedChannelId}>`,
+            content: `Whitelist channel added: <#${channelId}>`,
             ephemeral: false,
         });
     } catch (error) {
@@ -277,28 +216,15 @@ async function handleAddWhitelist(interaction, guildId, channelId, guildName) {
     }
 }
 
-async function handleRemoveWhitelist(interaction, guildId, channelId, guildName) {
+async function handleWhitelistRemove(interaction, guildId, channelId, guildName) {
     try {
-        // Update the document to pull the channelId from the whitelistChannels array
-        const channelOption = interaction.options.getChannel('remove');
-
-        if (!channelOption) {
-            return interaction.reply({
-                content: 'Please provide a channel to remove from the whitelist.',
-                ephemeral: true,
-            });
-        }
-
-        const removedChannelId = channelOption.id;
-
         await GuildSettings.findOneAndUpdate(
             { guildId },
-            { $pull: { 'star.whitelistChannelIds': removedChannelId } },
+            { $pull: { 'star.whitelistChannelIds': channelId } },
             { upsert: true }
         );
-
         await interaction.reply({
-            content: `Whitelist channel removed: <#${removedChannelId}>`,
+            content: `Whitelist channel removed: <#${channelId}>`,
             ephemeral: false,
         });
     } catch (error) {
@@ -310,51 +236,75 @@ async function handleRemoveWhitelist(interaction, guildId, channelId, guildName)
     }
 }
 
+async function handleWhitelistSet(interaction, guildId, channelId, guildName) {
+    try {
+        await GuildSettings.findOneAndUpdate(
+            { guildId },
+            { $addToSet: { 'star.starboardChannelIds': channelId }, guildName },
+            { upsert: true }
+        );
+        await interaction.reply({
+            content: `Starboard channel set: <#${channelId}>`,
+            ephemeral: false,
+        });
+    } catch (error) {
+        console.error('Error setting starboard channel:', error);
+        await interaction.reply({
+            content: 'Error setting starboard channel',
+            ephemeral: false,
+        });
+    }
+}
+
+async function getGuildSettings(guildId, guildName) {
+    try {
+        let guildSettings = await GuildSettings.findOne({ guildId });
+
+        if (!guildSettings) {
+            guildSettings = new GuildSettings({
+                guildId,
+                guildName,
+                star: {
+                    starboardChannelIds: '',
+                    starLevels: [],
+                    whitelistChannelIds: [],
+                },
+            });
+        }
+
+        return guildSettings;
+    } catch (error) {
+        console.error('Error getting guild settings:', error);
+        return null;
+    }
+}
+
 client.on('messageReactionAdd', async (reaction, user) => {
     const guildId = reaction.message.guild.id;
-    const guildSettings = await GuildSettings.findOne({
-        guildId
-    });
+    const guildSettings = await GuildSettings.findOne({ guildId });
 
     if (guildSettings && guildSettings.star.whitelistChannelIds.includes(reaction.message.channel.id)) {
         await checkReactions(reaction.message, guildSettings);
     }
 });
-
-let currentWebhookIndex = 0;
-const webhookConfigs = [{
-        id: process.env.WEBHOOK1_ID,
-        token: process.env.WEBHOOK1_TOKEN
-    },
-    {
-        id: process.env.WEBHOOK2_ID,
-        token: process.env.WEBHOOK2_TOKEN
-    },
-    // Add more webhook configurations if needed
-];
-
 async function checkReactions(message, guildSettings) {
-    const guildId = message.guild.id;
+    const starboardChannelIds = guildSettings.star.starboardChannelIds;
+
+    if (!starboardChannelIds.includes(message.channel.id)) {
+        console.error('Starboard channel not found. Cannot repost.');
+        return;
+    }
+
+    if (lock.has(message.id)) {
+        return;
+    }
+
+    lock.set(message.id, true);
 
     try {
-        const starboardChannel = client.channels.cache.get(STARBOARD_CHANNEL_ID);
-
-        if (!starboardChannel) {
-            console.error(`Starboard channel not found. Cannot repost.`);
-            return;
-        }
-
-        if (lock.has(message.id)) {
-            return;
-        }
-
-        lock.set(message.id, true);
-
         const fetchedMessage = await message.fetch(true);
         const reactions = fetchedMessage.reactions.cache;
         const totalReactions = reactions.reduce((acc, reaction) => acc + reaction.count, 0);
-
-        // Check if the totalReactions meets the criteria for any starboard level
         const starLevels = guildSettings.star.starLevels;
 
         const levelCriteria = starLevels.find(level => totalReactions === level.minReactions);
@@ -367,14 +317,11 @@ async function checkReactions(message, guildSettings) {
         const currentWebhookConfig = webhookConfigs[currentWebhookIndex];
         const webhookClient = new WebhookClient(currentWebhookConfig);
         const title = getStarboardTitle(levelCriteria.level);
-
         const serverAndChannelInfo = `<#${message.channel.id}>`;
-        const userAvatarURL = message.author.displayAvatarURL({
-            format: 'png',
-            dynamic: true,
-            size: 128
-        });
-        const starboardMessageContent = `${serverAndChannelInfo} | **${title} ` + `${message.author.globalName ? `${message.author.globalName}` : ''}** \`(${message.author.tag})\`` + `${message.content ? `\n${message.content}` : ''}\n - **การตอบรับที่ได้รับ**:\n${reactions.map(reaction => `${reaction.emoji} **${reaction.count}**`).join(' ㅤ ')}`;
+        const userAvatarURL = message.author.displayAvatarURL({ format: 'png', dynamic: true, size: 128 });
+        const starboardMessageContent = `${serverAndChannelInfo} | **${title} ` +
+            `${message.author.globalName ? `${message.author.globalName}` : ''}** \`(${message.author.tag})\`` +
+            `${message.content ? `\n${message.content}` : ''}\n - **การตอบรับที่ได้รับ**:\n${reactions.map(reaction => `${reaction.emoji} **${reaction.count}**`).join(' ㅤ ')}`;
 
         const starboardMessage = await webhookClient.send({
             content: starboardMessageContent,
