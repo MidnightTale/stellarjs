@@ -2,18 +2,18 @@
   "name": "stellarjs",
   "version": "1.0.0",
   "description": "",
-  "main": "./index.js",
+  "main": "./src/index.js",
   "nodemonConfig": {
     "ignore": [
       "./repostedMessages.json"
     ]
   },
   "scripts": {
-    "start": "bun index.js",
-    "dev": "bun nodemon index.js",
+    "start": "bun ./src/index.js",
+    "dev": "bun nodemon ./src/index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "author": "Keiko",
+  "author": "MidnightTale",
   "license": "ISC",
   "dependencies": {
     "axios": "^1.6.7",
